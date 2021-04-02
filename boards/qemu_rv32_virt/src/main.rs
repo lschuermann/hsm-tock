@@ -41,6 +41,19 @@ const FAULT_RESPONSE: kernel::procs::FaultResponse = kernel::procs::FaultRespons
 #[link_section = ".stack_buffer"]
 pub static mut STACK_MEMORY: [u8; 0x2000] = [0; 0x2000];
 
+// Dummy client, printing information about received packets
+// struct VirtIONetDummyClient(&'static capsules::virtio::devices::virtio_net::VirtIONet<'static>);
+// impl capsules::virtio::devices::virtio_net::VirtIONetClient for VirtIONetDummyClient {
+//     fn packet_received(&self, id: usize, buffer: &'static mut [u8], len: usize) {
+//         debug!("Packet received from virtio-net if {}, len {}.", id, len);
+//         self.0.return_rx_buffer(buffer);
+//     }
+
+//     fn packet_sent(&self, _id: usize, _buffer: &'static mut [u8]) {
+//         unimplemented!("VirtIONetDummyClient packet_sent");
+//     }
+// }
+
 /// A structure representing this platform that holds references to all
 /// capsules for this platform. We've included an alarm and console.
 struct QemuRv32VirtPlatform {
@@ -53,6 +66,7 @@ struct QemuRv32VirtPlatform {
         'static,
         VirtualMuxAlarm<'static, sifive::clint::Clint<'static>>,
     >,
+    virtio_rng: Option<&'static capsules::rng::RngDriver<'static>>,
 }
 
 /// Mapping of integer syscalls to objects that implement syscalls.
@@ -65,6 +79,13 @@ impl Platform for QemuRv32VirtPlatform {
             capsules::console::DRIVER_NUM => f(Some(self.console)),
             capsules::alarm::DRIVER_NUM => f(Some(self.alarm)),
             capsules::low_level_debug::DRIVER_NUM => f(Some(self.lldb)),
+            capsules::rng::DRIVER_NUM => {
+                if let Some(rng_driver) = self.virtio_rng {
+                    f(Some(rng_driver))
+                } else {
+                    f(None)
+                }
+            }
             _ => f(None),
         }
     }
@@ -152,7 +173,179 @@ pub unsafe fn main() {
     );
     hil::time::Alarm::set_alarm_client(virtual_alarm_user, alarm);
 
+    // ---------- VIRTIO PERIPHERAL DISCOVERY ----------
+    //
+    // This board has 8 virtio-mmio (v2 personality required!) devices
+    //
+    // Collect supported VirtIO peripheral indicies and initialize
+    // them if they are found. If there are two instances of a
+    // supported peripheral, the one on a higher-indexed VirtIO
+    // transport is used.
+    let (mut virtio_net_idx, mut virtio_rng_idx) = (None, None);
+    for (i, virtio_device) in peripherals.virtio_mmio.iter().enumerate() {
+        use capsules::virtio::{VirtIODeviceType, VirtIOTransport};
+        match virtio_device.query() {
+            Some(VirtIODeviceType::NetworkCard) => {
+                virtio_net_idx = Some(i);
+            }
+            Some(VirtIODeviceType::EntropySource) => {
+                virtio_rng_idx = Some(i);
+            }
+            _ => (),
+        }
+    }
+
+    // If there is a VirtIO EntropySource present, use the appropriate
+    // VirtIORng driver and expose it to userspace though the
+    // RngDriver
+    let virtio_rng_driver: Option<&'static capsules::rng::RngDriver<'static>> =
+        if let Some(rng_idx) = virtio_rng_idx {
+            use capsules::virtio::devices::virtio_rng::VirtIORng;
+            use capsules::virtio::queues::split_queue::{
+                SplitVirtQueue, VirtQueueAvailableRing, VirtQueueDescriptors, VirtQueueUsedRing,
+            };
+            use capsules::virtio::{VirtIOTransport, VirtQueue};
+            use kernel::hil::rng::Rng;
+
+            // EntropySource requires a single VirtQueue for retrieved entropy
+            let descriptors = static_init!(VirtQueueDescriptors, VirtQueueDescriptors::default(),);
+            let available_ring =
+                static_init!(VirtQueueAvailableRing, VirtQueueAvailableRing::default(),);
+            let used_ring = static_init!(VirtQueueUsedRing, VirtQueueUsedRing::default(),);
+            let queue = static_init!(
+                SplitVirtQueue,
+                SplitVirtQueue::new(descriptors, available_ring, used_ring),
+            );
+            queue.set_transport(&peripherals.virtio_mmio[rng_idx]);
+
+            // VirtIO EntropySource device driver instantiation
+            let rng = static_init!(VirtIORng, VirtIORng::new(queue, dynamic_deferred_caller));
+            rng.set_deferred_call_handle(
+                dynamic_deferred_caller
+                    .register(rng)
+                    .expect("no deferred call slot available for VirtIO RNG"),
+            );
+            queue.set_client(rng);
+
+            // Register the queues and driver with the transport, so
+            // interrupts are routed properly
+            let mmio_queues = static_init!([&'static dyn VirtQueue; 1], [queue; 1]);
+            peripherals.virtio_mmio[rng_idx].initialize(rng, mmio_queues);
+
+            // Provide an internal randomness buffer
+            let rng_buffer = static_init!([u8; 64], [0; 64]);
+            rng.provide_buffer(rng_buffer)
+                .expect("rng: providing initial buffer failed");
+
+            // Userspace RNG driver over the VirtIO EntropySource
+            let rng_driver: &'static mut capsules::rng::RngDriver = static_init!(
+                capsules::rng::RngDriver,
+                capsules::rng::RngDriver::new(
+                    rng,
+                    board_kernel.create_grant(&memory_allocation_cap),
+                ),
+            );
+            rng.set_client(rng_driver);
+
+            Some(rng_driver as &'static capsules::rng::RngDriver)
+        } else {
+            // No VirtIO EntropySource discovered
+            None
+        };
+
+    // If there is a VirtIO NetworkCard present, use the appropriate
+    // VirtIONet driver. Currently this is not used, as work on the
+    // userspace network driver and kernel network stack progresses.
+    //
+    // A template dummy driver is provided to verify basic
+    // functionality of this interface.
+    let _virtio_net_if: Option<&'static capsules::virtio::devices::virtio_net::VirtIONet<'static>> =
+        if let Some(net_idx) = virtio_net_idx {
+            use capsules::virtio::devices::virtio_net::VirtIONet;
+            use capsules::virtio::queues::split_queue::{
+                SplitVirtQueue, VirtQueueAvailableRing, VirtQueueDescriptors, VirtQueueUsedRing,
+            };
+            use capsules::virtio::{VirtIOTransport, VirtQueue};
+
+            // A VirtIO NetworkCard requires 2 VirtQueues:
+            // - a TX VirtQueue with buffers for outgoing packets
+            // - a RX VirtQueue where incoming packet buffers are
+            //   placed and filled by the device
+
+            // TX VirtQueue
+            let tx_descriptors =
+                static_init!(VirtQueueDescriptors, VirtQueueDescriptors::default(),);
+            let tx_available_ring =
+                static_init!(VirtQueueAvailableRing, VirtQueueAvailableRing::default(),);
+            let tx_used_ring = static_init!(VirtQueueUsedRing, VirtQueueUsedRing::default(),);
+            let tx_queue = static_init!(
+                SplitVirtQueue,
+                SplitVirtQueue::new(tx_descriptors, tx_available_ring, tx_used_ring),
+            );
+            tx_queue.set_transport(&peripherals.virtio_mmio[net_idx]);
+
+            // RX VirtQueue
+            let rx_descriptors =
+                static_init!(VirtQueueDescriptors, VirtQueueDescriptors::default(),);
+            let rx_available_ring =
+                static_init!(VirtQueueAvailableRing, VirtQueueAvailableRing::default(),);
+            let rx_used_ring = static_init!(VirtQueueUsedRing, VirtQueueUsedRing::default(),);
+            let rx_queue = static_init!(
+                SplitVirtQueue,
+                SplitVirtQueue::new(rx_descriptors, rx_available_ring, rx_used_ring),
+            );
+            rx_queue.set_transport(&peripherals.virtio_mmio[net_idx]);
+
+            // Incoming and outgoing packets are prefixed by a 12-byte
+            // VirtIO specific header
+            let tx_header_buf = static_init!([u8; 12], [0; 12]);
+            let rx_header_buf = static_init!([u8; 12], [0; 12]);
+
+            // Currently, provide a single receive buffer to write
+            // incoming packets into
+            let rx_buffer = static_init!([u8; 1526], [0; 1526]);
+
+            // Instantiate the VirtIONet (NetworkCard) driver and set
+            // the queues
+            let net = static_init!(
+                VirtIONet<'static>,
+                VirtIONet::new(
+                    0,
+                    tx_queue,
+                    tx_header_buf,
+                    rx_queue,
+                    rx_header_buf,
+                    rx_buffer,
+                ),
+            );
+            tx_queue.set_client(net);
+            rx_queue.set_client(net);
+
+            // Register the queues and driver with the transport, so
+            // interrupts are routed properly
+            let mmio_queues = static_init!([&'static dyn VirtQueue; 2], [rx_queue, tx_queue]);
+            peripherals.virtio_mmio[net_idx].initialize(net, mmio_queues);
+
+            // TODO: As soon as an appropriate driver is available,
+            // this should return a driver instead of an interface
+            // reference
+
+            // Dummy client, printing information about received packets
+            // let dummy_client = static_init!(VirtIONetDummyClient, VirtIONetDummyClient(net));
+            // net.set_client(dummy_client);
+
+            // Place a buffer in the receive VirtQueue, so the device
+            // can write the first packet to it
+            // net.initialize_rx();
+
+            Some(net as &'static VirtIONet)
+        } else {
+            // No VirtIO NetworkCard discovered
+            None
+        };
+
     // ---------- INITIALIZE CHIP, ENABLE INTERRUPTS ---------
+
     let chip = static_init!(
         QemuRv32VirtChip<
             VirtualMuxAlarm<'static, sifive::clint::Clint>,
@@ -197,9 +390,10 @@ pub unsafe fn main() {
     }
 
     let platform = QemuRv32VirtPlatform {
-        console: console,
-        alarm: alarm,
-        lldb: lldb,
+        console,
+        alarm,
+        lldb,
+        virtio_rng: virtio_rng_driver,
     };
 
     // ---------- PROCESS LOADING, SCHEDULER LOOP ----------
