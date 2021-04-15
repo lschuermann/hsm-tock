@@ -10,9 +10,9 @@ use rv32i::csr::{mcause, mie::mie, mip::mip, CSR};
 use rv32i::pmp::PMP;
 
 use crate::interrupts;
-use crate::plic::Plic;
 use crate::plic::PLIC;
 use kernel::InterruptService;
+use sifive::plic::Plic;
 
 pub struct E310x<'a, A: 'static + Alarm<'static>, I: InterruptService<()> + 'a> {
     userspace_kernel_boundary: rv32i::syscall::SysCall,
